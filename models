@@ -1,0 +1,198 @@
+local InsertService = game:GetService("InsertService")
+local Players = game:GetService("Players")
+
+local BATCH_SIZE = 2
+local BATCH_WAIT = 0.2
+
+local modelos = {
+    {
+        id = 97658710626718,
+        offset = 0,
+        rotacao = Vector3.new(0, 0, 0),
+        posicoes = {
+            Vector3.new(-556, 12743, 503),
+        }
+    },
+    {
+        id = 119426359828573,
+        offset = 0,
+        rotacao = Vector3.new(0, 0, 0),
+        posicoes = {
+            Vector3.new(-18266, 12777, 24841),
+        }
+    },
+}
+
+-- Agrupamentos (Model/Folder) que teleportam o jogador ao serem tocados
+local NOMES_TELEPORTE = {
+    ["destroyed planet"] = true,
+    ["A-417b"] = true,
+}
+local DESTINO_TELEPORTE = Vector3.new(-18181, 12890, 25059)
+local COOLDOWN_TELEPORTE = 2 -- segundos, evita teleportar várias vezes por causa de vários Touched seguidos
+
+local cooldowns = {}
+
+local cache = {}
+
+local function carregarAsset(id)
+    if cache[id] then return cache[id] end
+    local asset
+
+    local ok, res = pcall(function()
+        return InsertService:LoadAsset(id)
+    end)
+    if ok and res then
+        asset = res
+        print(("[%d] carregado via LoadAsset (%s)"):format(id, asset.ClassName))
+    else
+        warn(("[%d] LoadAsset falhou: %s"):format(id, tostring(res)))
+        local ok2, res2 = pcall(function()
+            return game:GetObjects("rbxassetid://" .. id)[1]
+        end)
+        if ok2 and res2 then
+            asset = res2
+            print(("[%d] carregado via GetObjects (%s)"):format(id, asset.ClassName))
+        else
+            warn(("[%d] GetObjects também falhou: %s"):format(id, tostring(res2)))
+        end
+    end
+
+    cache[id] = asset
+    return asset
+end
+
+local function anchorarTudo(modelo)
+    if modelo:IsA("BasePart") then
+        modelo.Anchored = true
+    end
+    for _, part in ipairs(modelo:GetDescendants()) do
+        if part:IsA("BasePart") then
+            part.Anchored = true
+        end
+    end
+end
+
+local function grausParaRad(v)
+    return math.rad(v.X), math.rad(v.Y), math.rad(v.Z)
+end
+
+local function posicionar(modelo, posicao, offset, rotacao)
+    local rx, ry, rz = grausParaRad(rotacao)
+    local rotExtra = CFrame.Angles(rx, ry, rz)
+
+    if modelo:IsA("Model") then
+        local pivoAtual = modelo:GetPivot()
+
+        local rotacaoOriginal = pivoAtual - pivoAtual.Position
+        local rotacaoFinal = rotacaoOriginal * rotExtra
+
+        modelo:PivotTo(CFrame.new(0, 0, 0) * rotacaoFinal)
+        local bbCFrame, tam = modelo:GetBoundingBox()
+        local baseY = bbCFrame.Y - (tam.Y / 2)
+        local alturaAtePivo = -baseY
+
+        local destino = CFrame.new(posicao.X, posicao.Y + alturaAtePivo + offset, posicao.Z) * rotacaoFinal
+        modelo:PivotTo(destino)
+
+        print(("Model '%s' posicionado em %s (tamanho %s)"):format(modelo.Name, tostring(destino.Position), tostring(tam)))
+    else
+        local part = modelo:IsA("BasePart") and modelo or modelo:FindFirstChildWhichIsA("BasePart")
+        if part then
+            local rotacaoOriginal = part.CFrame - part.Position
+            part.CFrame = CFrame.new(posicao.X, posicao.Y + (part.Size.Y / 2) + offset, posicao.Z)
+                * rotacaoOriginal
+                * rotExtra
+            print(("Part '%s' posicionada em %s"):format(part.Name, tostring(part.Position)))
+        else
+            warn("Nenhuma BasePart encontrada dentro do asset:", modelo:GetFullName())
+        end
+    end
+end
+
+local function conectarPartTeleporte(part, nomeGrupo)
+    part.Touched:Connect(function(hit)
+        local character = hit.Parent
+        local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+        if not humanoid then return end
+
+        local player = Players:GetPlayerFromCharacter(character)
+        if not player then return end
+
+        local agora = os.clock()
+        if cooldowns[player] and agora - cooldowns[player] < COOLDOWN_TELEPORTE then
+            return
+        end
+        cooldowns[player] = agora
+
+        local hrp = character:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            hrp.CFrame = CFrame.new(DESTINO_TELEPORTE)
+            print(("Jogador '%s' teleportado por tocar em '%s'"):format(player.Name, nomeGrupo))
+        end
+    end)
+end
+
+-- Procura, dentro de toda a árvore do asset clonado, qualquer agrupamento
+-- (Model ou Folder) cujo nome bata com NOMES_TELEPORTE, e conecta o Touched
+-- só nas partes daquele agrupamento (não no clone inteiro).
+local function conectarTeleporte(clone)
+    local candidatos = clone:GetDescendants()
+    table.insert(candidatos, clone)
+
+    for _, grupo in ipairs(candidatos) do
+        if (grupo:IsA("Model") or grupo:IsA("Folder")) and NOMES_TELEPORTE[grupo.Name] then
+            print(("Teleporte conectado no agrupamento '%s' (dentro de '%s')"):format(grupo.Name, clone.Name))
+
+            if grupo:IsA("Model") and grupo.PrimaryPart then
+                conectarPartTeleporte(grupo.PrimaryPart, grupo.Name)
+            end
+            for _, part in ipairs(grupo:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    conectarPartTeleporte(part, grupo.Name)
+                end
+            end
+        end
+    end
+end
+
+task.spawn(function()
+    local fila = {}
+    for _, info in ipairs(modelos) do
+        for _, pos in ipairs(info.posicoes) do
+            table.insert(fila, {info = info, pos = pos})
+        end
+    end
+
+    local count = 0
+    for _, item in ipairs(fila) do
+        local rot = item.info.rotacao or Vector3.new(0, 0, 0)
+        local asset = carregarAsset(item.info.id)
+        if asset then
+            local clone = asset:Clone()
+            clone.Parent = workspace
+            anchorarTudo(clone)
+            posicionar(clone, item.pos, item.info.offset, rot)
+            conectarTeleporte(clone)
+
+            task.wait()
+            if not clone.Parent then
+                warn(("[%d] o clone foi destruído/removido logo após posicionar (provável fora do MaxExtents)"):format(item.info.id))
+            end
+        else
+            warn("Falha ao carregar:", item.info.id)
+        end
+
+        count = count + 1
+        if count >= BATCH_SIZE then
+            count = 0
+            task.wait(BATCH_WAIT)
+        end
+    end
+
+    for id, asset in pairs(cache) do
+        if asset then asset:Destroy() end
+        cache[id] = nil
+    end
+    print("Todos os modelos carregados.")
+end)
